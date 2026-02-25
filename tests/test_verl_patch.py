@@ -4,21 +4,17 @@ Verifies that sink flash attention is correctly applied in the model's forward p
 """
 
 import torch
-import sys
-import os
-
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 
 def test_patch_with_hf_model():
     """Test that the patch intercepts attention in a real HF model."""
-    from verl_patch import patch_verl_with_sink_attention, unpatch_verl, _SINK_ATTENTION_CONFIG
+    from sink_attention.verl_patch import patch_verl_with_sink_attention, unpatch_verl, _SINK_ATTENTION_CONFIG
 
     # Track whether our kernel was called
     call_count = [0]
     original_sink_fa = None
 
-    import sink_flash_attention as sfa_module
+    import sink_attention.sink_flash_attention as sfa_module
     original_sink_fa = sfa_module.sink_flash_attention
 
     def tracking_sink_fa(q, k, v, num_sink=4, window_size=512):
@@ -31,8 +27,8 @@ def test_patch_with_hf_model():
     # Also patch the sink_flash_attention function to track calls
     sfa_module.sink_flash_attention = tracking_sink_fa
     # Re-import in verl_patch module
-    import verl_patch
-    verl_patch.sink_flash_attention = tracking_sink_fa
+    import sink_attention.verl_patch as verl_patch_module
+    verl_patch_module.sink_flash_attention = tracking_sink_fa
 
     # Load a small model
     from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -119,7 +115,7 @@ def test_patch_with_hf_model():
 
 def test_patch_function():
     """Test basic patch/unpatch functionality."""
-    from verl_patch import patch_verl_with_sink_attention, unpatch_verl, _SINK_ATTENTION_CONFIG
+    from sink_attention.verl_patch import patch_verl_with_sink_attention, unpatch_verl, _SINK_ATTENTION_CONFIG
     import transformers.modeling_flash_attention_utils as fa_utils
 
     original = fa_utils._flash_attention_forward

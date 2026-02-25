@@ -15,6 +15,7 @@ python -c "import torch; import triton; print(f'torch={torch.__version__}, trito
 
 echo "=== Running smoke tests ==="
 cd /home/rulin/sink_attention
-python test_sink_attention.py
+pip install -e . --quiet 2>/dev/null
+python tests/test_sink_attention.py
 
 echo "=== Done ==="

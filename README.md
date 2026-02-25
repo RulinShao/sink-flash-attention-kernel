@@ -4,10 +4,22 @@ A Triton kernel implementing [Flash Attention](https://arxiv.org/abs/2307.08691)
 
 Flash Attention 2 doesn't support sink attention. Flash Attention 3 does, but only runs on B200. This kernel fills the gap with a pure Triton implementation that works on any GPU Triton supports.
 
+## Installation
+
+```bash
+pip install sink-flash-attention
+```
+
+Or from source:
+
+```bash
+pip install git+https://github.com/RulinShao/sink-flash-attention-kernel.git
+```
+
 ## Quick Start
 
 ```python
-from sink_flash_attention import sink_flash_attention
+from sink_attention import sink_flash_attention
 
 output = sink_flash_attention(
     q,                # [B, H_q, N, D]
@@ -20,6 +32,16 @@ output = sink_flash_attention(
 # Fully differentiable -- use in training
 loss = output.sum()
 loss.backward()
+```
+
+### verl / HuggingFace Integration (one-liner)
+
+```python
+from sink_attention import patch_verl_with_sink_attention
+patch_verl_with_sink_attention(num_sink=4, window_size=4096)
+
+# All subsequent HF model attention calls now use sink flash attention.
+# Works with verl GRPO, FSDP, Ulysses SP -- no other code changes needed.
 ```
 
 ## What is Sink Attention?
@@ -210,26 +232,31 @@ See `docs/design.md` for details on ring attention integration.
 ## Running Tests
 
 ```bash
+pip install -e .
+
 # Basic correctness (requires GPU)
-cd sink_attention
-python test_sink_attention.py
+python tests/test_sink_attention.py
 
 # Extended tests + benchmarks
-python benchmark.py
-
-# Via SLURM
-sbatch run_tests.sh
-sbatch run_benchmark.sh
+python tests/benchmark.py
 ```
 
 ## Files
 
 ```
-sink_flash_attention.py   Triton kernels + PyTorch autograd wrapper
-sp_utils.py               Sequence parallelism utilities
-test_sink_attention.py    Correctness tests (11 configs)
-benchmark.py              Extended tests (29 configs) + performance benchmarks
-docs/design.md            Detailed design document
+sink_attention/
+├── __init__.py               Public API
+├── sink_flash_attention.py   Triton kernels + PyTorch autograd wrapper
+├── sp_utils.py               Sequence parallelism utilities
+└── verl_patch.py             verl/HuggingFace monkey patch
+tests/
+├── test_sink_attention.py    Correctness tests (11 configs)
+├── benchmark.py              Extended tests (29 configs) + benchmarks
+├── numerical_accuracy.py     Numerical accuracy measurement
+└── tune_block_sizes.py       Block size tuning sweep
+docs/
+└── design.md                 Detailed design document
+pyproject.toml                Package configuration
 ```
 
 ## Limitations and Future Work

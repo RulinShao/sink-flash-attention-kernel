@@ -11,4 +11,5 @@ echo "=== GPU Info ==="
 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
 
 cd /home/rulin/sink_attention
-python benchmark.py
+pip install -e . --quiet 2>/dev/null
+python tests/benchmark.py

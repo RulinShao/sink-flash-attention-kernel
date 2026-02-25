@@ -1,7 +1,7 @@
 """Measure numerical accuracy of sink flash attention vs reference."""
 import torch
 import math
-from sink_flash_attention import sink_flash_attention
+from sink_attention import sink_flash_attention
 
 
 def naive_sink_attention(q, k, v, num_sink, window_size):

@@ -6,3 +6,4 @@ slurm_*.err
 *.egg-info/
 dist/
 build/
+.eggs/

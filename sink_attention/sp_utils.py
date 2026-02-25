@@ -165,7 +165,7 @@ class SinkAttentionSPWrapper(torch.nn.Module):
         self.sp_group = sp_group
 
     def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
-        from sink_flash_attention import sink_flash_attention
+        from .sink_flash_attention import sink_flash_attention
 
         if self.sp_group is None or dist.get_world_size(self.sp_group) == 1:
             # No SP, just call directly

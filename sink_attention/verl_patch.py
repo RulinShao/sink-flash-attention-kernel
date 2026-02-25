@@ -22,18 +22,10 @@ How it works:
     - Variable-length (packed) sequences: falls back to original FA for varlen
 """
 
-import sys
-import os
-import math
 import torch
 from typing import Optional
 
-# Add sink_attention to path
-_SINK_ATTN_DIR = os.path.dirname(os.path.abspath(__file__))
-if _SINK_ATTN_DIR not in sys.path:
-    sys.path.insert(0, _SINK_ATTN_DIR)
-
-from sink_flash_attention import sink_flash_attention
+from .sink_flash_attention import sink_flash_attention
 
 # Global config
 _SINK_ATTENTION_CONFIG = {

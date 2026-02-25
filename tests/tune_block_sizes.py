@@ -11,12 +11,8 @@ import torch
 import triton
 import math
 import time
-import sys
-import os
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-
-from sink_flash_attention import (
+from sink_attention.sink_flash_attention import (
     _sink_flash_attn_fwd_kernel,
     _build_sink_window_mask,
     _fwd_inner,

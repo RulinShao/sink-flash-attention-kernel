@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sink-flash-attention"
+version = "0.1.0"
+description = "Triton kernel for Flash Attention with Attention Sink support"
+readme = "README.md"
+license = {text = "Apache-2.0"}
+requires-python = ">=3.9"
+authors = [
+    {name = "Rulin Shao"},
+]
+dependencies = [
+    "torch>=2.0",
+    "triton>=2.1",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "transformers",
+]
+
+[project.urls]
+Repository = "https://github.com/RulinShao/sink-flash-attention-kernel"
+
+[tool.setuptools.packages.find]
+include = ["sink_attention*"]
