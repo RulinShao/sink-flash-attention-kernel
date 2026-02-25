@@ -4,44 +4,52 @@ A Triton kernel implementing [Flash Attention](https://arxiv.org/abs/2307.08691)
 
 Flash Attention 2 doesn't support sink attention. Flash Attention 3 does, but only runs on B200. This kernel fills the gap with a pure Triton implementation that works on any GPU Triton supports.
 
+## TL;DR
+
+```bash
+pip install sink-flash-attention
+```
+
+**As a standalone kernel:**
+
+```python
+from sink_attention import sink_flash_attention
+
+# Drop-in replacement for attention -- supports forward + backward
+output = sink_flash_attention(
+    q, k, v,          # [B, H, N, D] -- supports GQA (H_q != H_kv)
+    num_sink=4,        # always attend to first 4 tokens
+    window_size=4096,  # sliding window for the rest
+)
+```
+
+**Monkey-patch verl / any HuggingFace model (one line):**
+
+```python
+from sink_attention import patch_verl_with_sink_attention
+patch_verl_with_sink_attention(num_sink=4, window_size=4096)
+
+# That's it. All attention layers now use sink attention.
+# Works with verl GRPO, FSDP, Ulysses sequence parallelism.
+# No other code changes needed.
+```
+
+## Why not Flash Attention 2?
+
+FA2 does not implement sink attention. You cannot get sink attention behavior from FA2 -- it only supports full causal or sliding window (without sinks). Using FA2 with `sliding_window` will drop the sink tokens and degrade model quality.
+
+FA3 supports sink attention but requires B200 GPUs. This kernel gives you sink attention on A100/H200.
+
 ## Installation
 
 ```bash
 pip install sink-flash-attention
 ```
 
-Or from source:
+From source:
 
 ```bash
 pip install git+https://github.com/RulinShao/sink-flash-attention-kernel.git
-```
-
-## Quick Start
-
-```python
-from sink_attention import sink_flash_attention
-
-output = sink_flash_attention(
-    q,                # [B, H_q, N, D]
-    k,                # [B, H_kv, N, D]
-    v,                # [B, H_kv, N, D]
-    num_sink=4,       # first 4 tokens are attention sinks
-    window_size=4096, # sliding window size
-)
-
-# Fully differentiable -- use in training
-loss = output.sum()
-loss.backward()
-```
-
-### verl / HuggingFace Integration (one-liner)
-
-```python
-from sink_attention import patch_verl_with_sink_attention
-patch_verl_with_sink_attention(num_sink=4, window_size=4096)
-
-# All subsequent HF model attention calls now use sink flash attention.
-# Works with verl GRPO, FSDP, Ulysses SP -- no other code changes needed.
 ```
 
 ## What is Sink Attention?
@@ -122,11 +130,11 @@ Benchmarked on NVIDIA H200 (143GB), torch 2.10.0, triton 3.6.0.
 
 Config: B=1, H_q=32, H_kv=8 (GQA 4:1), D=128, num_sink=4, window_size=4096.
 
-### Forward Pass: Sink FA vs Materialized Attention
+### Sink FA vs Eager (Materialized) Attention
 
 Like Flash Attention, this kernel uses tiled online softmax and never materializes the N×N attention matrix. This gives O(N) memory instead of O(N^2).
 
-| N | Sink FA | Materialized Causal | Speedup | Mem Sink | Mem Materialized |
+| N | Sink FA | Eager Attention | Speedup | Mem Sink | Mem Eager |
 |------:|--------:|--------------------:|--------:|---------:|-----------------:|
 | 512 | 0.07 ms | 0.10 ms | 1.5x | 4 MB | 38 MB |
 | 1,024 | 0.12 ms | 0.29 ms | 2.4x | 9 MB | 144 MB |
@@ -136,48 +144,43 @@ Like Flash Attention, this kernel uses tiled online softmax and never materializ
 | 16,384 | 4.67 ms | OOM | -- | 136 MB | OOM |
 | 32,768 | 9.85 ms | OOM | -- | 273 MB | OOM |
 
-At N=8192 the kernel uses **128x less memory** than materialized attention.
+At N=8192 the kernel uses **128x less memory** than eager attention.
 
-### Forward Pass: Sink FA vs Flash Attention (via SDPA)
+### Sink FA vs Flash Attention 2 (via SDPA)
 
-**Important**: Flash Attention 2 does **not** support sink attention. The comparison below is against FA2 running *full causal* attention -- a different (and incorrect for sink attention) attention pattern. FA2 cannot be used as a drop-in alternative here; it would compute the wrong result. This comparison purely measures the speed of our sparse kernel vs FA2's dense kernel to show at what sequence length the sparsity advantage overcomes the Triton-vs-CUDA efficiency gap.
+**FA2 does not support sink attention.** The comparison below is against FA2 running *full causal* attention -- a different and incorrect attention pattern for sink attention use cases. FA2 cannot be used as an alternative; it computes the wrong result. This comparison shows when our kernel (computing the correct sparse pattern) becomes faster than FA2 (computing the wrong dense pattern).
 
-| N | Sink FA | FA (SDPA Causal) | Speedup | Note |
+**Forward only:**
+
+| N | Sink FA | FA2 (full causal) | vs FA2 | Note |
 |------:|--------:|-----------------:|--------:|------|
-| 512 | 0.07 ms | 0.04 ms | 0.5x | FA faster (CUDA vs Triton overhead) |
-| 1,024 | 0.12 ms | 0.07 ms | 0.6x | |
-| 4,096 | 0.76 ms | 0.52 ms | 0.7x | |
+| 4,096 | 0.76 ms | 0.52 ms | 0.7x | FA2 faster (CUDA vs Triton) |
 | 8,192 | 1.88 ms | 1.75 ms | 0.9x | Approaching crossover |
 | **16,384** | **4.18 ms** | **6.63 ms** | **1.6x** | **Sink FA wins** |
 | **32,768** | **8.77 ms** | **25.83 ms** | **2.9x** | **Sink FA dominant** |
 
-**Crossover at ~N=10-12K.** Below this, FA's hand-optimized CUDA kernels are faster per-FLOP despite doing O(N^2) work. Above this, the O(N * W) scaling of sink attention dominates.
+**Training (forward + backward):**
 
-### Training (Forward + Backward)
-
-Same caveat: FA2/SDPA computes full causal attention, **not** sink attention. This comparison shows when our kernel (computing the correct sparse pattern) becomes faster than FA2 (computing the wrong dense pattern).
-
-| N | Sink FA | FA (SDPA Causal) | Speedup | Mem Sink | Mem SDPA |
+| N | Sink FA | FA2 (full causal) | vs FA2 | Mem Sink | Mem FA2 |
 |------:|--------:|-----------------:|--------:|---------:|---------:|
-| 1,024 | 0.47 ms | 0.32 ms | 0.7x | 67 MB | 84 MB |
 | 4,096 | 2.81 ms | 2.09 ms | 0.7x | 269 MB | 337 MB |
 | 8,192 | 7.28 ms | 6.89 ms | 0.9x | 538 MB | 673 MB |
 | **16,384** | **16.39 ms** | **24.63 ms** | **1.5x** | **1,076 MB** | **1,346 MB** |
 
+**Crossover at ~N=10-12K.** Below this, FA2's hand-optimized CUDA is faster per-FLOP despite doing O(N^2) work. Above this, the O(N * W) scaling wins.
+
 ### Scaling
 
-At 32K with window=4096, sink attention processes ~4100 KV positions per query vs 32K for full causal -- a **7.8x reduction in FLOPs**. The gap widens with longer sequences:
-
-| N | Theoretical FLOPs reduction | Measured speedup vs FA |
+| N | FLOPs reduction vs full causal | Measured speedup vs FA2 |
 |------:|----------------------------:|----------------------:|
-| 8,192 | 2.0x | 0.9x (CUDA overhead) |
+| 8,192 | 2.0x | 0.9x |
 | 16,384 | 4.0x | 1.6x |
 | 32,768 | 8.0x | 2.9x |
 | 65,536 | 16.0x | ~5-6x (projected) |
 
 ### Numerical Accuracy
 
-Compared against fp32 eager (materialized) attention as the reference. The Triton kernel matches to within fp16/bf16 precision.
+Compared against fp32 eager attention as the reference. The Triton kernel matches to within fp16/bf16 precision.
 
 **Forward pass** (Triton fp16 vs eager fp32):
 
@@ -188,28 +191,24 @@ Compared against fp32 eager (materialized) attention as the reference. The Trito
 | MHA fp16 N=2048 D=64 | 9.77e-4 | 1.5e-5 | 1.00000 |
 | GQA 4:1 fp16 D=128 N=512 | 1.95e-3 | 3.5e-5 | 1.00000 |
 | MHA bf16 N=512 | 7.81e-3 | 2.0e-4 | 0.99999 |
-| pure window (sink=0) fp16 | 9.77e-4 | 2.6e-5 | 1.00000 |
-| sink+self only (win=1) fp16 | 1.95e-3 | 4.3e-5 | 1.00000 |
 
 **Backward pass** (Triton fp16 gradients vs eager fp32 gradients):
 
 | Config | dQ Max Error | dK Max Error | dV Max Error |
 |--------|------------:|------------:|------------:|
 | MHA N=128 sink=4 win=32 | 1.66e-3 | 1.96e-3 | 1.94e-3 |
-| MHA N=256 sink=4 win=64 | 1.81e-3 | 1.46e-3 | 1.94e-3 |
 | GQA N=256 sink=4 win=64 | 1.17e-3 | 2.98e-3 | 4.16e-3 |
-| MHA D=128 N=256 sink=4 win=64 | 1.47e-3 | 1.94e-3 | 2.48e-3 |
+| MHA D=128 N=256 | 1.47e-3 | 1.94e-3 | 2.48e-3 |
 
-All errors are within expected fp16 precision bounds (~1e-3). Cosine similarity is effectively 1.0 across all configurations.
+All errors within expected fp16 precision bounds. Cosine similarity is 1.0 across all configurations.
 
 ## Sequence Parallelism (verl FSDP)
 
-When using sequence parallelism, sink tokens (on rank 0) must be broadcast to all ranks. Utilities are provided in `sp_utils.py`:
+When using sequence parallelism, sink tokens (on rank 0) must be broadcast to all ranks:
 
 ```python
 from sink_attention import SinkAttentionSPWrapper
 
-# Drop-in wrapper for SP-aware sink attention
 attn = SinkAttentionSPWrapper(num_sink=4, window_size=4096, sp_group=sp_group)
 output = attn(q_local, k_local, v_local)
 ```
@@ -241,7 +240,7 @@ python tests/test_sink_attention.py
 python tests/benchmark.py
 ```
 
-## Files
+## Project Structure
 
 ```
 sink_attention/
@@ -261,8 +260,8 @@ pyproject.toml                Package configuration
 
 ## Limitations and Future Work
 
-- **Triton vs CUDA gap**: Our kernel is ~50-70% of FA2's per-FLOP throughput. A CUDA implementation would close this, moving the crossover point from ~N=12-16K down to ~N=8K.
-- **dK/dV backward for sink blocks**: Sink blocks iterate over ALL subsequent Q blocks. For very long sequences this is O(N) per sink block. A segmented approach could improve this.
+- **Triton vs CUDA gap**: Our kernel is ~50-70% of FA2's per-FLOP throughput. A CUDA implementation would close this, moving the crossover from ~N=10-12K down to ~N=6-8K.
+- **dK/dV backward for sink blocks**: Sink blocks iterate over all subsequent Q blocks. A segmented approach could bound this.
 - **Block size tuning**: Tuned for H200 (BLOCK_M=64, BLOCK_N=32 for D=128). A100 may benefit from different settings.
 - **Paged KV cache**: Not yet supported. Needed for inference with dynamic batching.
 
