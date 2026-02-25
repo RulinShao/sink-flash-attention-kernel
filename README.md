@@ -100,43 +100,83 @@ Benchmarked on NVIDIA H200 (143GB), torch 2.10.0, triton 3.6.0.
 
 Config: B=1, H_q=32, H_kv=8 (GQA 4:1), D=128, num_sink=4, window_size=4096.
 
-### Forward Pass: Sink FA vs PyTorch SDPA (Causal)
+### Forward Pass: Sink FA vs Materialized Attention
 
-SDPA dispatches to FlashAttention 2/3 internally on H200.
+Like Flash Attention, this kernel uses tiled online softmax and never materializes the N×N attention matrix. This gives O(N) memory instead of O(N^2).
 
-| N | Sink FA | SDPA Causal | Speedup | Mem Sink | Mem SDPA |
-|------:|--------:|------------:|--------:|---------:|---------:|
-| 512 | 0.07 ms | 0.04 ms | 0.5x | 4 MB | 4 MB |
-| 1,024 | 0.12 ms | 0.07 ms | 0.6x | 9 MB | 9 MB |
-| 2,048 | 0.27 ms | 0.19 ms | 0.7x | 17 MB | 17 MB |
-| 4,096 | 0.81 ms | 0.52 ms | 0.6x | 34 MB | 34 MB |
-| 8,192 | 2.10 ms | 1.75 ms | 0.8x | 68 MB | 68 MB |
-| **16,384** | **4.71 ms** | **6.65 ms** | **1.4x** | **136 MB** | **136 MB** |
-| **32,768** | **9.93 ms** | **26.14 ms** | **2.6x** | **273 MB** | **273 MB** |
+| N | Sink FA | Materialized Causal | Speedup | Mem Sink | Mem Materialized |
+|------:|--------:|--------------------:|--------:|---------:|-----------------:|
+| 512 | 0.07 ms | 0.10 ms | 1.5x | 4 MB | 38 MB |
+| 1,024 | 0.12 ms | 0.29 ms | 2.4x | 9 MB | 144 MB |
+| 2,048 | 0.27 ms | 1.07 ms | 3.9x | 17 MB | 558 MB |
+| 4,096 | 0.80 ms | 4.70 ms | 5.8x | 34 MB | **2,198 MB** |
+| 8,192 | 2.09 ms | 20.20 ms | **9.5x** | 68 MB | **8,724 MB** |
+| 16,384 | 4.67 ms | OOM | -- | 136 MB | OOM |
+| 32,768 | 9.85 ms | OOM | -- | 273 MB | OOM |
 
-**Crossover at ~N=12-16K.** Below this, SDPA's hand-optimized CUDA kernels are faster per-FLOP despite doing O(N^2) work. Above this, the O(N * W) scaling of sink attention dominates.
+At N=8192 the kernel uses **128x less memory** than materialized attention.
+
+### Forward Pass: Sink FA vs Flash Attention (via SDPA)
+
+SDPA dispatches to FlashAttention 2/3 internally. Both use O(N) memory, so the comparison isolates the compute savings from sparse (sink+window) vs dense (full causal) attention.
+
+| N | Sink FA | FA (SDPA Causal) | Speedup | Note |
+|------:|--------:|-----------------:|--------:|------|
+| 512 | 0.07 ms | 0.04 ms | 0.5x | FA faster (CUDA vs Triton overhead) |
+| 1,024 | 0.12 ms | 0.07 ms | 0.6x | |
+| 4,096 | 0.81 ms | 0.52 ms | 0.6x | |
+| 8,192 | 2.10 ms | 1.75 ms | 0.8x | Approaching crossover |
+| **16,384** | **4.71 ms** | **6.65 ms** | **1.4x** | **Sink FA wins** |
+| **32,768** | **9.93 ms** | **26.14 ms** | **2.6x** | **Sink FA dominant** |
+
+**Crossover at ~N=12-16K.** Below this, FA's hand-optimized CUDA kernels are faster per-FLOP despite doing O(N^2) work. Above this, the O(N * W) scaling of sink attention dominates.
 
 ### Training (Forward + Backward)
 
-| N | Sink FA | SDPA Causal | Speedup | Mem Sink | Mem SDPA |
-|------:|--------:|------------:|--------:|---------:|---------:|
+| N | Sink FA | FA (SDPA Causal) | Speedup | Mem Sink | Mem SDPA |
+|------:|--------:|-----------------:|--------:|---------:|---------:|
 | 1,024 | 0.48 ms | 0.33 ms | 0.7x | 67 MB | 84 MB |
 | 4,096 | 2.85 ms | 2.09 ms | 0.7x | 269 MB | 337 MB |
 | 8,192 | 7.50 ms | 6.87 ms | 0.9x | 538 MB | 673 MB |
 | **16,384** | **16.91 ms** | **24.79 ms** | **1.5x** | **1,076 MB** | **1,346 MB** |
 
-Memory savings from sink attention are consistent: **20% less** in training due to reduced backward compute.
-
 ### Scaling
 
 At 32K with window=4096, sink attention processes ~4100 KV positions per query vs 32K for full causal -- a **7.8x reduction in FLOPs**. The gap widens with longer sequences:
 
-| N | Theoretical FLOPs reduction | Measured speedup vs SDPA |
-|------:|----------------------------:|-------------------------:|
+| N | Theoretical FLOPs reduction | Measured speedup vs FA |
+|------:|----------------------------:|----------------------:|
 | 8,192 | 2.0x | 0.8x (CUDA overhead) |
 | 16,384 | 4.0x | 1.4x |
 | 32,768 | 8.0x | 2.6x |
 | 65,536 | 16.0x | ~5x (projected) |
+
+### Numerical Accuracy
+
+Compared against fp32 eager (materialized) attention as the reference. The Triton kernel matches to within fp16/bf16 precision.
+
+**Forward pass** (Triton fp16 vs eager fp32):
+
+| Config | Max Abs Error | Mean Abs Error | Cosine Similarity |
+|--------|-------------:|---------------:|------------------:|
+| MHA fp16 N=256 D=64 | 9.77e-4 | 2.6e-5 | 1.00000 |
+| MHA fp16 N=1024 D=64 | 9.77e-4 | 1.9e-5 | 1.00000 |
+| MHA fp16 N=2048 D=64 | 9.77e-4 | 1.5e-5 | 1.00000 |
+| GQA 4:1 fp16 D=128 N=512 | 1.95e-3 | 3.5e-5 | 1.00000 |
+| MHA bf16 N=512 | 7.81e-3 | 2.0e-4 | 0.99999 |
+| pure window (sink=0) fp16 | 9.77e-4 | 2.6e-5 | 1.00000 |
+| sink+self only (win=1) fp16 | 1.95e-3 | 4.3e-5 | 1.00000 |
+
+**Backward pass** (Triton fp16 gradients vs eager fp32 gradients):
+
+| Config | dQ Max Error | dK Max Error | dV Max Error |
+|--------|------------:|------------:|------------:|
+| MHA N=128 sink=4 win=32 | 1.66e-3 | 1.96e-3 | 1.94e-3 |
+| MHA N=256 sink=4 win=64 | 1.81e-3 | 1.46e-3 | 1.94e-3 |
+| GQA N=256 sink=4 win=64 | 1.17e-3 | 2.98e-3 | 4.16e-3 |
+| MHA D=128 N=256 sink=4 win=64 | 1.47e-3 | 1.94e-3 | 2.48e-3 |
+
+All errors are within expected fp16 precision bounds (~1e-3). Cosine similarity is effectively 1.0 across all configurations.
 
 ## Sequence Parallelism (verl FSDP)
 
