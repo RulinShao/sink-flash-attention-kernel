@@ -5,6 +5,9 @@ from .sp_utils import (
     reduce_sink_kv_grads,
     SinkAttentionSPWrapper,
 )
+from .cache import SinkCacheLayer, SinkAttentionCache
+from .decode_kernel import sink_decode_attention
+from .generate_patch import patch_for_generation, unpatch_generation
 
 __version__ = "0.1.0"
 
@@ -15,4 +18,9 @@ __all__ = [
     "prepare_sink_kv_for_sp",
     "reduce_sink_kv_grads",
     "SinkAttentionSPWrapper",
+    "SinkCacheLayer",
+    "SinkAttentionCache",
+    "sink_decode_attention",
+    "patch_for_generation",
+    "unpatch_generation",
 ]

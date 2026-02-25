@@ -34,6 +34,15 @@ patch_verl_with_sink_attention(num_sink=4, window_size=4096)
 # No other code changes needed.
 ```
 
+**Inference with KV cache:**
+
+```python
+from sink_attention import patch_for_generation
+
+cache = patch_for_generation(model, num_sink=4, window_size=4096)
+output = model.generate(input_ids, past_key_values=cache, max_new_tokens=1024)
+```
+
 ## Why not Flash Attention 2?
 
 FA2 does not implement sink attention. You cannot get sink attention behavior from FA2 -- it only supports full causal or sliding window (without sinks). Using FA2 with `sliding_window` will drop the sink tokens and degrade model quality.
@@ -210,6 +219,78 @@ Compared against fp32 eager attention as the reference. The Triton kernel matche
 
 All errors within expected fp16 precision bounds. Cosine similarity is 1.0 across all configurations.
 
+## Inference
+
+The inference module provides KV cache management with sink + sliding window eviction and a decode-time attention kernel. During generation, the cache retains `num_sink` initial tokens permanently and maintains a circular buffer of the most recent `window_size` tokens.
+
+### Usage
+
+```python
+from sink_attention import patch_for_generation, unpatch_generation
+
+# Patch model and get cache
+cache = patch_for_generation(model, num_sink=4, window_size=4096)
+
+# Generate as normal — cache is passed as past_key_values
+output = model.generate(input_ids, past_key_values=cache, max_new_tokens=1024)
+
+# Restore original attention when done
+unpatch_generation()
+```
+
+### Decode Numerical Accuracy
+
+Decode outputs compared against fp32 naive reference (NVIDIA H200, PyTorch 2.10.0, CUDA 12.8):
+
+| Config | Max Abs Error | Mean Abs Error | Cosine Similarity |
+|--------|-------------:|---------------:|------------------:|
+| MHA(4) D=64 N=20 fp32 | 2.98e-7 | 4.61e-8 | 1.000000 |
+| MHA(4) D=128 N=32 fp32 | 1.79e-7 | 3.53e-8 | 1.000000 |
+| GQA(8/2) D=64 N=24 fp32 | 3.28e-7 | 5.15e-8 | 1.000000 |
+| GQA(32/8) D=128 N=64 fp32 | 4.47e-7 | 3.87e-8 | 1.000000 |
+| MHA(4) D=64 N=20 fp16 | 9.77e-4 | 1.11e-4 | 1.000000 |
+| GQA(32/8) D=128 N=64 fp16 | 9.77e-4 | 8.91e-5 | 1.000000 |
+| GQA(8/2) D=128 N=32 bf16 | 7.81e-3 | 1.01e-3 | 0.999992 |
+
+Multi-step decode with eviction (worst-case error across all decode steps):
+
+| Config | Avg Max Error | Worst Error |
+|--------|-------------:|------------:|
+| MHA(4) D=64 sink=2 win=4 10 steps fp32 | 2.41e-7 | 3.58e-7 |
+| MHA(4) D=128 sink=4 win=8 20 steps fp32 | 2.56e-7 | 4.77e-7 |
+| GQA(8/2) D=64 sink=4 win=8 15 steps fp32 | 2.68e-7 | 5.96e-7 |
+| MHA(4) D=64 sink=2 win=4 10 steps fp16 | 9.52e-4 | 1.22e-3 |
+| MHA(4) D=128 sink=4 win=8 20 steps fp16 | 9.31e-4 | 1.95e-3 |
+
+### Decode Latency
+
+Decode kernel (single-query attention against cached KV) compared to running the full training kernel with N_q=1. Config: B=1, GQA(32/8), D=128, num_sink=4.
+
+| Window Size | N_kv | Decode | Training Kernel | Speedup |
+|------------:|-----:|-------:|----------------:|--------:|
+| 128 | 132 | 0.056 ms | 0.032 ms | 0.6x |
+| 512 | 516 | 0.057 ms | 0.034 ms | 0.6x |
+| 1,024 | 1,028 | 0.056 ms | 0.088 ms | 1.6x |
+| 2,048 | 2,052 | 0.069 ms | 0.284 ms | 4.1x |
+| 4,096 | 4,100 | 0.119 ms | 0.944 ms | **7.9x** |
+
+With GQA(64/8):
+
+| Window Size | N_kv | Decode | Training Kernel | Speedup |
+|------------:|-----:|-------:|----------------:|--------:|
+| 1,024 | 1,028 | 0.068 ms | 0.152 ms | 2.2x |
+| 4,096 | 4,100 | 0.209 ms | 1.724 ms | **8.2x** |
+
+### Cache + Decode Overhead
+
+Per-step overhead including cache update (circular buffer write + linearization) and decode attention:
+
+| Config | Cache Update | Decode Attn | Total |
+|--------|------------:|------------:|------:|
+| GQA(32/8) D=128 win=1024 | 0.057 ms | 0.057 ms | 0.114 ms |
+| GQA(32/8) D=128 win=4096 | 0.081 ms | 0.120 ms | 0.201 ms |
+| GQA(64/8) D=128 win=4096 | 0.080 ms | 0.210 ms | 0.290 ms |
+
 ## Sequence Parallelism (verl FSDP)
 
 When using sequence parallelism, sink tokens (on rank 0) must be broadcast to all ranks:
@@ -244,6 +325,15 @@ pip install -e .
 # Basic correctness (requires GPU)
 python tests/test_sink_attention.py
 
+# Cache correctness
+python tests/test_cache.py
+
+# Inference decode correctness
+python tests/test_inference.py
+
+# Full inference benchmarks (numerical accuracy + latency)
+python tests/run_inference_benchmarks.py
+
 # Extended tests + benchmarks
 python tests/benchmark.py
 ```
@@ -254,10 +344,16 @@ python tests/benchmark.py
 sink_attention/
 ├── __init__.py               Public API
 ├── sink_flash_attention.py   Triton kernels + PyTorch autograd wrapper
+├── cache.py                  KV cache (sink buffer + circular window buffer)
+├── decode_kernel.py          Decode-time attention (single-query)
+├── generate_patch.py         HuggingFace generate() integration
 ├── sp_utils.py               Sequence parallelism utilities
-└── verl_patch.py             verl/HuggingFace monkey patch
+└── verl_patch.py             verl/HuggingFace monkey patch (training)
 tests/
-├── test_sink_attention.py    Correctness tests (11 configs)
+├── test_sink_attention.py    Kernel correctness tests (11 configs)
+├── test_cache.py             Cache correctness tests (13 tests)
+├── test_inference.py         Inference decode tests (6 tests)
+├── run_inference_benchmarks.py  Numerical accuracy + latency benchmarks
 ├── benchmark.py              Extended tests (29 configs) + benchmarks
 ├── numerical_accuracy.py     Numerical accuracy measurement
 └── tune_block_sizes.py       Block size tuning sweep
@@ -271,7 +367,9 @@ pyproject.toml                Package configuration
 - **Triton vs CUDA gap**: Our kernel is ~50-70% of FA2's per-FLOP throughput. A CUDA implementation would close this, moving the crossover from ~N=10-12K down to ~N=6-8K.
 - **dK/dV backward for sink blocks**: Sink blocks iterate over all subsequent Q blocks. A segmented approach could bound this.
 - **Block size tuning**: Tuned for H200 (BLOCK_M=64, BLOCK_N=32 for D=128). A100 may benefit from different settings.
+- **Optimized decode kernel**: Current decode uses PyTorch matmul. A fused Triton kernel for single-query attention would reduce overhead.
 - **Paged KV cache**: Not yet supported. Needed for inference with dynamic batching.
+- **Per-batch sequence lengths**: Cache state (write_pos, window_len) is shared across the batch. All sequences must have equal length.
 
 ## References
 
