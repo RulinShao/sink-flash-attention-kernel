@@ -130,6 +130,14 @@ Benchmarked on NVIDIA H200 (143GB), torch 2.10.0, triton 3.6.0.
 
 Config: B=1, H_q=32, H_kv=8 (GQA 4:1), D=128, num_sink=4, window_size=4096.
 
+### Forward Pass
+
+![Forward pass latency and memory comparison](docs/performance.png)
+
+### Training (Forward + Backward)
+
+![Training latency and memory comparison](docs/training.png)
+
 ### Sink FA vs Eager (Materialized) Attention
 
 Like Flash Attention, this kernel uses tiled online softmax and never materializes the N×N attention matrix. This gives O(N) memory instead of O(N^2).
