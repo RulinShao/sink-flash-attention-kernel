@@ -61,11 +61,6 @@ eager_valid_n = [n for n, m in zip(N, eager_ms) if m is not None]
 eager_valid_ms = [m for m in eager_ms if m is not None]
 ax1.plot(eager_valid_n, eager_valid_ms, 'o--', color=EAGER_COLOR, linewidth=2,
          markersize=8, label='Eager (materialized)', zorder=2)
-# OOM markers
-for n, m in zip(N, eager_ms):
-    if m is None:
-        ax1.annotate('OOM', (n, ax1.get_ylim()[1] if ax1.get_ylim()[1] > 1 else 30),
-                     fontsize=10, color=EAGER_COLOR, ha='center', fontweight='bold')
 
 # FA2
 ax1.plot(N, fa2_ms, 's--', color=FA2_COLOR, linewidth=2, markersize=8,
@@ -117,9 +112,9 @@ ax2.plot(eager_valid_n_mem, eager_valid_mem, 'o--', color=EAGER_COLOR, linewidth
          markersize=8, label='Eager (materialized)', zorder=2)
 
 # OOM markers for eager
-ax2.annotate('OOM', xy=(16384, 12000), fontsize=11, color=EAGER_COLOR,
+ax2.annotate('OOM', xy=(16384, 16000), fontsize=11, color=EAGER_COLOR,
              fontweight='bold', ha='center')
-ax2.annotate('OOM', xy=(32768, 15000), fontsize=11, color=EAGER_COLOR,
+ax2.annotate('OOM', xy=(32768, 16000), fontsize=11, color=EAGER_COLOR,
              fontweight='bold', ha='center')
 
 # FA2 memory
@@ -144,7 +139,7 @@ ax2.set_title('Forward Pass Memory Usage', fontsize=15, fontweight='bold', pad=1
 ax2.set_xticks(N)
 ax2.set_xticklabels(['512', '1K', '2K', '4K', '8K', '16K', '32K'])
 ax2.legend(loc='upper left', fontsize=11, framealpha=0.9)
-ax2.set_ylim(2, 20000)
+ax2.set_ylim(2, 25000)
 
 plt.tight_layout(w_pad=3)
 plt.savefig('/home/rulin/sink_attention/docs/performance.png', dpi=150, bbox_inches='tight',
