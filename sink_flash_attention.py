@@ -440,14 +440,19 @@ class SinkFlashAttentionFunc(torch.autograd.Function):
         o = torch.empty_like(q)
         lse = torch.empty(B, H_q, N, device=q.device, dtype=torch.float32)
 
-        BLOCK_M = 128
-        BLOCK_N = 64
-        if D >= 256:
-            BLOCK_M = 64
-            BLOCK_N = 32
-        elif D >= 128:
-            BLOCK_M = 64
+        # Block sizes -- tuned on H200 (227KB SRAM per SM)
+        # Smaller BLOCK_N gives better parallelism for forward
+        BLOCK_M = 64
+        BLOCK_N = 32
+        if D <= 64:
+            BLOCK_M = 128
             BLOCK_N = 64
+
+        # Backward uses larger BLOCK_N for fewer loop iterations in dK/dV
+        BLOCK_M_BWD = BLOCK_M
+        BLOCK_N_BWD = 64
+        if D <= 64:
+            BLOCK_N_BWD = 64
 
         NUM_SINK_BLOCKS = triton.cdiv(num_sink, BLOCK_N) if num_sink > 0 else 0
         # Max window blocks any Q block needs: ceil((window_size + BLOCK_M) / BLOCK_N)
@@ -478,6 +483,8 @@ class SinkFlashAttentionFunc(torch.autograd.Function):
         ctx.scale = scale
         ctx.BLOCK_M = BLOCK_M
         ctx.BLOCK_N = BLOCK_N
+        ctx.BLOCK_M_BWD = BLOCK_M_BWD
+        ctx.BLOCK_N_BWD = BLOCK_N_BWD
 
         return o
 
@@ -487,8 +494,8 @@ class SinkFlashAttentionFunc(torch.autograd.Function):
         num_sink = ctx.num_sink
         window_size = ctx.window_size
         scale = ctx.scale
-        BLOCK_M = ctx.BLOCK_M
-        BLOCK_N = ctx.BLOCK_N
+        BLOCK_M = ctx.BLOCK_M_BWD
+        BLOCK_N = ctx.BLOCK_N_BWD
 
         B, H_q, N, D = q.shape
         H_kv = k.shape[1]

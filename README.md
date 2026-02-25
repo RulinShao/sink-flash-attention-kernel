@@ -118,27 +118,29 @@ At N=8192 the kernel uses **128x less memory** than materialized attention.
 
 ### Forward Pass: Sink FA vs Flash Attention (via SDPA)
 
-SDPA dispatches to FlashAttention 2/3 internally. Both use O(N) memory, so the comparison isolates the compute savings from sparse (sink+window) vs dense (full causal) attention.
+**Important**: Flash Attention 2 does **not** support sink attention. The comparison below is against FA2 running *full causal* attention -- a different (and incorrect for sink attention) attention pattern. FA2 cannot be used as a drop-in alternative here; it would compute the wrong result. This comparison purely measures the speed of our sparse kernel vs FA2's dense kernel to show at what sequence length the sparsity advantage overcomes the Triton-vs-CUDA efficiency gap.
 
 | N | Sink FA | FA (SDPA Causal) | Speedup | Note |
 |------:|--------:|-----------------:|--------:|------|
 | 512 | 0.07 ms | 0.04 ms | 0.5x | FA faster (CUDA vs Triton overhead) |
 | 1,024 | 0.12 ms | 0.07 ms | 0.6x | |
-| 4,096 | 0.81 ms | 0.52 ms | 0.6x | |
-| 8,192 | 2.10 ms | 1.75 ms | 0.8x | Approaching crossover |
-| **16,384** | **4.71 ms** | **6.65 ms** | **1.4x** | **Sink FA wins** |
-| **32,768** | **9.93 ms** | **26.14 ms** | **2.6x** | **Sink FA dominant** |
+| 4,096 | 0.76 ms | 0.52 ms | 0.7x | |
+| 8,192 | 1.88 ms | 1.75 ms | 0.9x | Approaching crossover |
+| **16,384** | **4.18 ms** | **6.63 ms** | **1.6x** | **Sink FA wins** |
+| **32,768** | **8.77 ms** | **25.83 ms** | **2.9x** | **Sink FA dominant** |
 
-**Crossover at ~N=12-16K.** Below this, FA's hand-optimized CUDA kernels are faster per-FLOP despite doing O(N^2) work. Above this, the O(N * W) scaling of sink attention dominates.
+**Crossover at ~N=10-12K.** Below this, FA's hand-optimized CUDA kernels are faster per-FLOP despite doing O(N^2) work. Above this, the O(N * W) scaling of sink attention dominates.
 
 ### Training (Forward + Backward)
 
+Same caveat: FA2/SDPA computes full causal attention, **not** sink attention. This comparison shows when our kernel (computing the correct sparse pattern) becomes faster than FA2 (computing the wrong dense pattern).
+
 | N | Sink FA | FA (SDPA Causal) | Speedup | Mem Sink | Mem SDPA |
 |------:|--------:|-----------------:|--------:|---------:|---------:|
-| 1,024 | 0.48 ms | 0.33 ms | 0.7x | 67 MB | 84 MB |
-| 4,096 | 2.85 ms | 2.09 ms | 0.7x | 269 MB | 337 MB |
-| 8,192 | 7.50 ms | 6.87 ms | 0.9x | 538 MB | 673 MB |
-| **16,384** | **16.91 ms** | **24.79 ms** | **1.5x** | **1,076 MB** | **1,346 MB** |
+| 1,024 | 0.47 ms | 0.32 ms | 0.7x | 67 MB | 84 MB |
+| 4,096 | 2.81 ms | 2.09 ms | 0.7x | 269 MB | 337 MB |
+| 8,192 | 7.28 ms | 6.89 ms | 0.9x | 538 MB | 673 MB |
+| **16,384** | **16.39 ms** | **24.63 ms** | **1.5x** | **1,076 MB** | **1,346 MB** |
 
 ### Scaling
 
@@ -146,10 +148,10 @@ At 32K with window=4096, sink attention processes ~4100 KV positions per query v
 
 | N | Theoretical FLOPs reduction | Measured speedup vs FA |
 |------:|----------------------------:|----------------------:|
-| 8,192 | 2.0x | 0.8x (CUDA overhead) |
-| 16,384 | 4.0x | 1.4x |
-| 32,768 | 8.0x | 2.6x |
-| 65,536 | 16.0x | ~5x (projected) |
+| 8,192 | 2.0x | 0.9x (CUDA overhead) |
+| 16,384 | 4.0x | 1.6x |
+| 32,768 | 8.0x | 2.9x |
+| 65,536 | 16.0x | ~5-6x (projected) |
 
 ### Numerical Accuracy
 
@@ -232,9 +234,9 @@ docs/design.md            Detailed design document
 
 ## Limitations and Future Work
 
-- **Triton vs CUDA gap**: Our kernel is ~50-70% of FA2's per-FLOP throughput. A CUDA implementation would close this, moving the crossover point to ~N=8K.
+- **Triton vs CUDA gap**: Our kernel is ~50-70% of FA2's per-FLOP throughput. A CUDA implementation would close this, moving the crossover point from ~N=12-16K down to ~N=8K.
 - **dK/dV backward for sink blocks**: Sink blocks iterate over ALL subsequent Q blocks. For very long sequences this is O(N) per sink block. A segmented approach could improve this.
-- **Block size tuning**: Currently tuned for A100. H200/B200 have more SRAM and could benefit from larger blocks.
+- **Block size tuning**: Tuned for H200 (BLOCK_M=64, BLOCK_N=32 for D=128). A100 may benefit from different settings.
 - **Paged KV cache**: Not yet supported. Needed for inference with dynamic batching.
 
 ## References
