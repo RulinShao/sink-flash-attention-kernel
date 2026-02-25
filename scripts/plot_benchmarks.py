@@ -64,7 +64,7 @@ ax1.plot(eager_valid_n, eager_valid_ms, 'o--', color=EAGER_COLOR, linewidth=2,
 
 # FA2
 ax1.plot(N, fa2_ms, 's--', color=FA2_COLOR, linewidth=2, markersize=8,
-         label='Flash Attention 2 (full causal)', zorder=2)
+         label='Flash Attention 2 (full causal, no sink support)', zorder=2)
 
 # Sink FA (highlighted)
 ax1.plot(N, sink_fa_ms, 'D-', color=SINK_COLOR, linewidth=3, markersize=9,
@@ -141,6 +141,10 @@ ax2.set_xticklabels(['512', '1K', '2K', '4K', '8K', '16K', '32K'])
 ax2.legend(loc='upper left', fontsize=11, framealpha=0.9)
 ax2.set_ylim(2, 25000)
 
+fig.text(0.5, -0.02,
+         'Note: FA2 does not support sink attention — it computes full causal (incorrect for sink attention use cases).',
+         ha='center', fontsize=11, style='italic', color='#666666')
+
 plt.tight_layout(w_pad=3)
 plt.savefig('/home/rulin/sink_attention/docs/performance.png', dpi=150, bbox_inches='tight',
             facecolor='white', edgecolor='none')
@@ -155,7 +159,7 @@ fig2, axes2 = plt.subplots(1, 2, figsize=(16, 6.5))
 
 ax3 = axes2[0]
 ax3.plot(N_train, fa2_train_ms, 's--', color=FA2_COLOR, linewidth=2, markersize=8,
-         label='Flash Attention 2 (full causal)', zorder=2)
+         label='Flash Attention 2 (full causal, no sink support)', zorder=2)
 ax3.plot(N_train, sink_fa_train_ms, 'D-', color=SINK_COLOR, linewidth=3, markersize=9,
          label='Sink Flash Attention (ours)', zorder=3)
 ax3.fill_between(N_train, [0]*len(N_train), sink_fa_train_ms, alpha=0.08, color=SINK_COLOR)
@@ -180,7 +184,7 @@ ax3.legend(loc='upper left', fontsize=11, framealpha=0.9)
 
 ax4 = axes2[1]
 ax4.plot(N_train, fa2_train_mem, 's--', color=FA2_COLOR, linewidth=2, markersize=8,
-         label='Flash Attention 2 (full causal)', zorder=2)
+         label='Flash Attention 2 (full causal, no sink support)', zorder=2)
 ax4.plot(N_train, sink_fa_train_mem, 'D-', color=SINK_COLOR, linewidth=3, markersize=9,
          label='Sink Flash Attention (ours)', zorder=3)
 ax4.fill_between(N_train, [0]*len(N_train), sink_fa_train_mem, alpha=0.08, color=SINK_COLOR)
@@ -197,6 +201,10 @@ ax4.set_title('Training Memory (Forward + Backward)', fontsize=15, fontweight='b
 ax4.set_xticks(N_train)
 ax4.set_xticklabels(['512', '1K', '2K', '4K', '8K', '16K'])
 ax4.legend(loc='upper left', fontsize=11, framealpha=0.9)
+
+fig2.text(0.5, -0.02,
+          'Note: FA2 does not support sink attention — it computes full causal (incorrect for sink attention use cases).',
+          ha='center', fontsize=11, style='italic', color='#666666')
 
 plt.tight_layout(w_pad=3)
 plt.savefig('/home/rulin/sink_attention/docs/training.png', dpi=150, bbox_inches='tight',
