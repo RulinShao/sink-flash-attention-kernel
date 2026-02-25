@@ -119,7 +119,7 @@ ax2.annotate('OOM', xy=(32768, 16000), fontsize=11, color=EAGER_COLOR,
 
 # FA2 memory
 ax2.plot(N, fa2_mem, 's--', color=FA2_COLOR, linewidth=2, markersize=8,
-         label='Flash Attention 2 (full causal)', zorder=2)
+         label='Flash Attention 2 (full causal, no sink support)', zorder=2)
 
 # Sink FA memory (highlighted)
 ax2.plot(N, sink_fa_mem, 'D-', color=SINK_COLOR, linewidth=3, markersize=9,
