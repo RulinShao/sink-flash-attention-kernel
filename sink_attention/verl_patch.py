@@ -24,6 +24,7 @@ import torch
 from typing import Optional
 
 from .sink_flash_attention import sink_flash_attention
+from .decode_kernel import sink_decode_attention
 
 # Store original function for fallback
 _original_flash_attention_forward = None
@@ -72,6 +73,10 @@ def _sink_flash_attention_forward(
     has_varlen = all(x is not None for x in (cu_seq_lens_q, cu_seq_lens_k, max_length_q, max_length_k))
     has_packed = position_ids is not None and query_states.size(0) > 0 and _is_packed(position_ids)
 
+    # Fall back for cases we can't handle at all
+    N_q = query_states.shape[1]
+    N_kv = key_states.shape[1]
+
     if has_varlen or has_packed or not is_causal or attention_mask is not None or softcap is not None:
         # Restore s_aux to kwargs for fallback (original FA ignores it harmlessly)
         if s_aux is not None:
@@ -86,6 +91,39 @@ def _sink_flash_attention_forward(
             max_length_k=max_length_k, target_dtype=target_dtype,
             implementation=implementation, **kwargs,
         )
+
+    # Decode step: N_q=1, N_kv=large (KV cache during model.generate())
+    # Use FlashDecoding kernel which parallelizes over KV blocks and
+    # correctly handles s_aux without materializing the full attention matrix.
+    if N_q != N_kv:
+        H_q = query_states.shape[2]
+
+        # Handle s_aux for decode (typically no SP during inference)
+        s_aux_local = None
+        if s_aux is not None:
+            H_total = s_aux.shape[0]
+            if H_total == H_q:
+                s_aux_local = s_aux
+            elif H_total > H_q and H_total % H_q == 0:
+                try:
+                    from verl.utils.ulysses import get_ulysses_sequence_parallel_rank
+                    sp_rank = get_ulysses_sequence_parallel_rank()
+                except (ImportError, RuntimeError):
+                    sp_rank = 0
+                    if torch.distributed.is_initialized():
+                        sp_size = H_total // H_q
+                        sp_rank = torch.distributed.get_rank() % sp_size
+                s_aux_local = s_aux[sp_rank * H_q : (sp_rank + 1) * H_q]
+
+        # Transpose: [B, N, H, D] -> [B, H, N, D]
+        q = query_states.transpose(1, 2).contiguous()
+        k = key_states.transpose(1, 2).contiguous()
+        v = value_states.transpose(1, 2).contiguous()
+
+        out = sink_decode_attention(q, k, v, s_aux=s_aux_local)
+
+        # Transpose back: [B, H, N, D] -> [B, N, H, D]
+        return out.transpose(1, 2).contiguous()
 
     # Input shape: [B, N, H, D] (transformers convention)
     B, N, H_q, D = query_states.shape
@@ -167,6 +205,11 @@ def patch_verl_with_sink_attention():
     3. verl.models.transformers.monkey_patch (used by Ulysses SP wrapper)
     """
     global _original_flash_attention_forward
+
+    # Guard: only patch once to avoid saving the patched function as "original"
+    # (which would cause infinite recursion in fallback paths)
+    if _original_flash_attention_forward is not None:
+        return
 
     # Patch transformers' _flash_attention_forward
     import transformers.modeling_flash_attention_utils as fa_utils
