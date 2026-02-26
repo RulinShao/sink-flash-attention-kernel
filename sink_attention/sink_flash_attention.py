@@ -94,6 +94,7 @@ def _fwd_inner(
 def _sink_flash_attn_fwd_kernel(
     Q, K, V, O,
     LSE,
+    S_AUX,  # Learnable sink scalar per Q-head [H_q], or null pointer
     stride_qb, stride_qh, stride_qn, stride_qd,
     stride_kb, stride_kh, stride_kn, stride_kd,
     stride_vb, stride_vh, stride_vn, stride_vd,
@@ -110,6 +111,7 @@ def _sink_flash_attn_fwd_kernel(
     NUM_Q_HEADS: tl.constexpr,
     NUM_SINK_BLOCKS: tl.constexpr,
     MAX_WINDOW_BLOCKS: tl.constexpr,
+    USE_S_AUX: tl.constexpr = False,
 ):
     pid_m = tl.program_id(0)
     pid_bh = tl.program_id(1)
@@ -130,8 +132,18 @@ def _sink_flash_attn_fwd_kernel(
     q = (q * scale).to(q.dtype)
 
     acc = tl.zeros([BLOCK_M, D], dtype=tl.float32)
+    # Default initialisation for online softmax (no s_aux)
     m_i = tl.full([BLOCK_M], value=float('-inf'), dtype=tl.float32)
     l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
+
+    # s_aux initialization: pre-load the learnable sink scalar into the
+    # online softmax state so it contributes exp(s_aux) to the denominator
+    # without contributing to the weighted sum of V (no associated value).
+    if USE_S_AUX:
+        s_aux_val = tl.load(S_AUX + pid_h)  # scalar per Q head
+        # Override: set m_i = s_aux, l_i = 1.0  (exp(s_aux - s_aux) = 1)
+        m_i = tl.full([BLOCK_M], value=0.0, dtype=tl.float32) + s_aux_val
+        l_i = tl.full([BLOCK_M], value=1.0, dtype=tl.float32)
 
     k_base = K + pid_b * stride_kb + pid_kv_h * stride_kh
     v_base = V + pid_b * stride_vb + pid_kv_h * stride_vh
@@ -424,12 +436,17 @@ def _sink_flash_attn_bwd_dq_kernel(
 
 class SinkFlashAttentionFunc(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, q, k, v, num_sink, window_size):
+    def forward(ctx, q, k, v, num_sink, window_size, s_aux=None):
         B, H_q, N, D = q.shape
         H_kv = k.shape[1]
         assert k.shape == (B, H_kv, N, D)
         assert v.shape == (B, H_kv, N, D)
         assert H_q % H_kv == 0
+
+        use_s_aux = s_aux is not None
+        if use_s_aux:
+            assert s_aux.shape == (H_q,), f"s_aux shape must be [H_q={H_q}], got {s_aux.shape}"
+            s_aux = s_aux.contiguous().float()
 
         scale = 1.0 / math.sqrt(D)
 
@@ -460,8 +477,12 @@ class SinkFlashAttentionFunc(torch.autograd.Function):
 
         grid = (triton.cdiv(N, BLOCK_M), B * H_q)
 
+        # S_AUX pointer: use the actual tensor if provided, else pass a dummy
+        s_aux_ptr = s_aux if use_s_aux else q  # dummy pointer, won't be loaded
+
         _sink_flash_attn_fwd_kernel[grid](
             q, k, v, o, lse,
+            s_aux_ptr,
             q.stride(0), q.stride(1), q.stride(2), q.stride(3),
             k.stride(0), k.stride(1), k.stride(2), k.stride(3),
             v.stride(0), v.stride(1), v.stride(2), v.stride(3),
@@ -475,9 +496,10 @@ class SinkFlashAttentionFunc(torch.autograd.Function):
             NUM_KV_HEADS=H_kv, NUM_Q_HEADS=H_q,
             NUM_SINK_BLOCKS=NUM_SINK_BLOCKS,
             MAX_WINDOW_BLOCKS=MAX_WINDOW_BLOCKS,
+            USE_S_AUX=use_s_aux,
         )
 
-        ctx.save_for_backward(q, k, v, o, lse)
+        ctx.save_for_backward(q, k, v, o, lse, s_aux if use_s_aux else torch.empty(0, device=q.device))
         ctx.num_sink = num_sink
         ctx.window_size = window_size
         ctx.scale = scale
@@ -485,15 +507,17 @@ class SinkFlashAttentionFunc(torch.autograd.Function):
         ctx.BLOCK_N = BLOCK_N
         ctx.BLOCK_M_BWD = BLOCK_M_BWD
         ctx.BLOCK_N_BWD = BLOCK_N_BWD
+        ctx.use_s_aux = use_s_aux
 
         return o
 
     @staticmethod
     def backward(ctx, do):
-        q, k, v, o, lse = ctx.saved_tensors
+        q, k, v, o, lse, s_aux_saved = ctx.saved_tensors
         num_sink = ctx.num_sink
         window_size = ctx.window_size
         scale = ctx.scale
+        use_s_aux = ctx.use_s_aux
         BLOCK_M = ctx.BLOCK_M_BWD
         BLOCK_N = ctx.BLOCK_N_BWD
 
@@ -501,7 +525,7 @@ class SinkFlashAttentionFunc(torch.autograd.Function):
         H_kv = k.shape[1]
 
         do = do.contiguous()
-        D_arr = (do.float() * o.float()).sum(dim=-1)
+        D_arr = (do.float() * o.float()).sum(dim=-1)  # [B, H_q, N]
 
         dq = torch.empty_like(q)
         dk = torch.empty(B, H_q, N, D, device=k.device, dtype=k.dtype)
@@ -561,10 +585,24 @@ class SinkFlashAttentionFunc(torch.autograd.Function):
             dk = dk.view(B, H_kv, groups, N, D).sum(dim=2)
             dv = dv.view(B, H_kv, groups, N, D).sum(dim=2)
 
-        return dq, dk, dv, None, None
+        # Gradient for s_aux (learnable sink parameter)
+        # The s_aux contributes exp(s_aux_h) / sum_j(exp(s_j)) to the softmax
+        # normalization. Its gradient is:
+        #   ds_aux_h = -sum_{b,n} exp(s_aux_h - lse_{b,h,n}) * D_{b,h,n}
+        # where D_{b,h,n} = sum_d(dO_{b,h,n,d} * O_{b,h,n,d})
+        ds_aux = None
+        if use_s_aux:
+            s_aux = s_aux_saved  # [H_q]
+            # exp(s_aux_h - lse_{b,h,n}): softmax weight of the sink
+            # Shape: s_aux[H_q] -> [1, H_q, 1], lse[B, H_q, N]
+            sink_prob = torch.exp(s_aux[None, :, None] - lse)  # [B, H_q, N]
+            # ds_aux_h = -sum_{b,n} sink_prob_{b,h,n} * D_{b,h,n}
+            ds_aux = -(sink_prob * D_arr).sum(dim=(0, 2))  # [H_q]
+
+        return dq, dk, dv, None, None, ds_aux
 
 
-def sink_flash_attention(q, k, v, num_sink=4, window_size=512):
+def sink_flash_attention(q, k, v, num_sink=4, window_size=512, s_aux=None):
     """
     Flash Attention with Attention Sink support.
 
@@ -574,8 +612,13 @@ def sink_flash_attention(q, k, v, num_sink=4, window_size=512):
         v: Value tensor [B, H_kv, N, D]
         num_sink: Number of sink tokens (default: 4)
         window_size: Sliding window size (default: 512)
+        s_aux: Optional learnable sink scalar per Q-head [H_q].
+               When provided, initializes the online softmax with
+               m_i = s_aux, l_i = 1, causing exp(s_aux) to contribute
+               to the softmax denominator without affecting the value sum.
+               This implements the gpt-oss "attention sink" mechanism.
 
     Returns:
         Output tensor [B, H_q, N, D]
     """
-    return SinkFlashAttentionFunc.apply(q, k, v, num_sink, window_size)
+    return SinkFlashAttentionFunc.apply(q, k, v, num_sink, window_size, s_aux)
