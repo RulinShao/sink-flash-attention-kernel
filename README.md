@@ -423,19 +423,27 @@ tests/
 ├── numerical_accuracy.py     Numerical accuracy measurement
 └── tune_block_sizes.py       Block size tuning sweep
 docs/
-└── design.md                 Detailed design document
+├── design.md                 Algorithm design, SP integration, kernel details
+└── architecture.md           Prefill/decode split rationale, FA3 comparison
 pyproject.toml                Package configuration
 ```
+
+## Architecture: Prefill/Decode Split and FA3 Comparison
+
+We use **separate prefill and decode kernels** by design. See [`docs/architecture.md`](docs/architecture.md) for a detailed discussion of:
+
+- **Why not a unified kernel on H200?** — The parallelism problem: with N_q=1, a prefill-style kernel only launches 64 programs (one per head at B=1) on 132 SMs. FlashDecoding parallelizes over KV splits instead, launching 32K+ programs.
+- **Why FA3 can unify on B200** — TMA (async memory engine), warp specialization, and 1.67× higher HBM bandwidth let FA3 hide the serial KV walk.
+- **Backward efficiency vs FA3** — Our Triton backward is ~0.5–0.7× FA2's CUDA throughput on H200, with <1% overhead from `ds_aux`. FA3 on B200 is ~2–3× faster (mostly hardware gap, not algorithmic).
+- **Alignment with FA3 semantics** — Mathematically identical `s_aux` handling (softmax init: m=s_aux, l=1, o=0). Verified against gpt-oss eager reference.
 
 ## Limitations and Future Work
 
 - **Triton vs CUDA gap**: Our kernel is ~50-70% of FA2's per-FLOP throughput. A CUDA implementation would close this, moving the crossover from ~N=10-12K down to ~N=6-8K.
 - **dK/dV backward for sink blocks**: Sink blocks iterate over all subsequent Q blocks. A segmented approach could bound this.
 - **Block size tuning**: Tuned for H200 (BLOCK_M=64, BLOCK_N=32 for D=128). A100 may benefit from different settings.
-- **Optimized decode kernel**: Current decode uses PyTorch matmul. A fused Triton kernel for single-query attention would reduce overhead.
 - **Paged KV cache**: Not yet supported. Needed for inference with dynamic batching.
 - **Per-batch sequence lengths**: Cache state (write_pos, window_len) is shared across the batch. All sequences must have equal length.
-- **s_aux in decode kernel**: The decode kernel does not yet handle `s_aux`. Currently only the training (prefill) kernel supports it.
 
 ## References
 

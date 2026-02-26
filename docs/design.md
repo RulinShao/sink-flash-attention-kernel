@@ -227,10 +227,23 @@ def reduce_sink_kv_grads(dk, dv, num_sink, sp_group):
 ```
 sink_attention/
 ├── __init__.py                  # Public API
-├── sink_flash_attention.py      # Triton kernels + PyTorch wrapper
-├── test_sink_attention.py       # Correctness tests
-└── docs/
-    └── design.md                # This document
+├── sink_flash_attention.py      # Triton kernels + PyTorch wrapper (prefill, with s_aux)
+├── decode_kernel.py             # FlashDecoding kernel (decode, with s_aux)
+├── verl_patch.py                # Monkey-patch for verl / HuggingFace models
+├── cache.py                     # KV cache (sink buffer + circular window)
+├── generate_patch.py            # HuggingFace generate() integration
+└── sp_utils.py                  # Sequence parallelism utilities
+tests/
+├── test_sink_attention.py       # Kernel correctness tests
+├── test_s_aux.py                # s_aux forward/backward/gradient tests
+├── test_decode_kernel.py        # FlashDecoding kernel tests
+├── test_gpt_oss_model.py        # End-to-end model comparison
+├── test_cache.py                # Cache correctness tests
+├── test_inference.py            # Inference decode tests
+└── benchmark.py                 # Extended tests + benchmarks
+docs/
+├── design.md                    # This document (algorithm & SP integration)
+└── architecture.md              # Prefill/decode split, FA3 comparison
 ```
 
 ## Usage
