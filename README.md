@@ -440,7 +440,6 @@ We use **separate prefill and decode kernels** by design. See [`docs/architectur
 ## Limitations and Future Work
 
 - **Triton vs CUDA gap**: Our kernel is ~50-70% of FA2's per-FLOP throughput. A CUDA implementation would close this, moving the crossover from ~N=10-12K down to ~N=6-8K.
-- **dK/dV backward for sink blocks**: Sink blocks iterate over all subsequent Q blocks. A segmented approach could bound this.
 - **Block size tuning**: Tuned for H200 (BLOCK_M=64, BLOCK_N=32 for D=128). A100 may benefit from different settings.
 - **Paged KV cache**: Not yet supported. Needed for inference with dynamic batching.
 - **Per-batch sequence lengths**: Cache state (write_pos, window_len) is shared across the batch. All sequences must have equal length.

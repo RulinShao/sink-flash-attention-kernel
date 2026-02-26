@@ -72,7 +72,10 @@ correctly rescales the sink contributions.
 
 2. **Backward dK/dV kernel** (`_sink_flash_attn_bwd_dkdv_kernel`): For each KV
    block, iterates over Q blocks that attend to it. Grid:
-   `(ceil(N/BLOCK_N), B*H_q)`.
+   `(ceil(N/BLOCK_N), B*H_q)`. Uses a **two-branch loop** to bound iteration:
+   - Sink KV blocks: iterate all subsequent Q blocks (O(N), unavoidable).
+   - Window KV blocks: iterate only `MAX_Q_BLOCKS_PER_WINDOW` Q blocks (O(W)).
+   This gives up to 30× fewer loop iterations at N=128K, window=4096.
 
 3. **Backward dQ kernel** (`_sink_flash_attn_bwd_dq_kernel`): For each Q block,
    iterates over KV blocks it attends to (same two-phase pattern as forward).
@@ -209,17 +212,13 @@ def reduce_sink_kv_grads(dk, dv, num_sink, sp_group):
 
 ### Potential Optimizations (Future Work)
 
-1. **Block skipping in backward**: The dK/dV kernel currently iterates over all
-   Q blocks for each KV block. For window blocks, only nearby Q blocks attend to
-   them -- this loop can be bounded more tightly.
-
-2. **Split-K for dK/dV with GQA**: When many Q heads map to one KV head,
+1. **Split-K for dK/dV with GQA**: When many Q heads map to one KV head,
    parallelize the accumulation across Q heads using atomic adds.
 
-3. **Persistent kernels**: For very long sequences, a persistent kernel that
+2. **Persistent kernels**: For very long sequences, a persistent kernel that
    reuses thread blocks across multiple Q rows could improve occupancy.
 
-4. **Paged KV cache**: For inference with dynamic batching, support paged KV
+3. **Paged KV cache**: For inference with dynamic batching, support paged KV
    cache layouts (block tables).
 
 ## File Structure

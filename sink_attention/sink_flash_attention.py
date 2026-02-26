@@ -195,8 +195,63 @@ def _sink_flash_attn_fwd_kernel(
 
 
 # ============================================================================
-# Backward Kernel - dK, dV
+# Backward Kernel - dK, dV (helper + kernel)
 # ============================================================================
+
+@triton.jit
+def _bwd_dkdv_inner(
+    dk, dv, k, v,
+    Q_bh, DO_bh, LSE_bh, D_bh,
+    offs_n, mask_n, offs_d,
+    stride_qn, stride_qd,
+    stride_don, stride_dod,
+    stride_lsen,
+    stride_dn,
+    block_m_start, block_m_end,
+    num_sink: tl.constexpr, window_size: tl.constexpr,
+    scale: tl.constexpr,
+    N: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    NUM_BLOCKS_LIMIT: tl.constexpr,
+):
+    """Process a range of Q blocks for dK/dV accumulation."""
+    for block_idx in range(NUM_BLOCKS_LIMIT):
+        block_m = block_m_start + block_idx
+        if block_m < block_m_end:
+            q_start = block_m * BLOCK_M
+            offs_m = q_start + tl.arange(0, BLOCK_M)
+            mask_m = offs_m < N
+
+            q_ptrs = Q_bh + offs_m[:, None] * stride_qn + offs_d[None, :] * stride_qd
+            q = tl.load(q_ptrs, mask=mask_m[:, None], other=0.0)
+            q = (q * scale).to(q.dtype)
+
+            do_ptrs = DO_bh + offs_m[:, None] * stride_don + offs_d[None, :] * stride_dod
+            do = tl.load(do_ptrs, mask=mask_m[:, None], other=0.0)
+
+            lse_ptrs = LSE_bh + offs_m * stride_lsen
+            lse = tl.load(lse_ptrs, mask=mask_m, other=0.0)
+
+            d_ptrs = D_bh + offs_m * stride_dn
+            Di = tl.load(d_ptrs, mask=mask_m, other=0.0)
+
+            s = tl.dot(q, tl.trans(k))
+            valid_mask = _build_sink_window_mask(offs_m, offs_n, mask_m, mask_n,
+                                                  num_sink, window_size)
+
+            p = tl.exp(s - lse[:, None])
+            p = tl.where(valid_mask, p, 0.0)
+
+            dv += tl.dot(tl.trans(p.to(do.dtype)), do)
+
+            dp = tl.dot(do, tl.trans(v))
+            ds = p * (dp - Di[:, None])
+            ds = tl.where(valid_mask, ds, 0.0)
+
+            dk += tl.dot(tl.trans(ds.to(q.dtype)), q)
+
+    return dk, dv
+
 
 @triton.jit
 def _sink_flash_attn_bwd_dkdv_kernel(
@@ -221,12 +276,17 @@ def _sink_flash_attn_bwd_dkdv_kernel(
     NUM_KV_HEADS: tl.constexpr,
     NUM_Q_HEADS: tl.constexpr,
     NUM_Q_BLOCKS: tl.constexpr,
+    MAX_Q_BLOCKS_PER_WINDOW: tl.constexpr,
 ):
     """Compute dK and dV. Grid: (num_kv_blocks, B * H_q).
 
     For each KV block, we iterate over Q blocks that attend to it.
-    - If this is a sink block: all Q blocks from (kv_block) to end attend to it.
-    - If this is a window block: only Q blocks within window_size attend to it.
+    - Sink KV blocks: all Q blocks from (kv_block) to end attend → O(N) loop.
+    - Window KV blocks: only nearby Q blocks attend → O(window_size) loop.
+
+    This two-branch structure avoids iterating NUM_Q_BLOCKS times for window
+    blocks. For N=128K, window=4096, BLOCK_M=64: window blocks iterate ~66
+    times instead of 2048 — a ~30x reduction in loop overhead.
     """
     pid_n = tl.program_id(0)
     pid_bh = tl.program_id(1)
@@ -250,57 +310,51 @@ def _sink_flash_attn_bwd_dkdv_kernel(
     dk = tl.zeros([BLOCK_N, D], dtype=tl.float32)
     dv = tl.zeros([BLOCK_N, D], dtype=tl.float32)
 
+    # Pre-compute batch-head base pointers (avoids passing 8 extra strides)
+    Q_bh = Q + pid_b * stride_qb + pid_h * stride_qh
+    DO_bh = DO + pid_b * stride_dob + pid_h * stride_doh
+    LSE_bh = LSE + pid_b * stride_lseb + pid_h * stride_lseh
+    D_bh = D_arr + pid_b * stride_db + pid_h * stride_dh
+
     is_sink_block = kv_start < num_sink
 
-    # Determine Q block range that attends to this KV block
     if is_sink_block:
-        # Sink blocks: all Q blocks where q >= kv_start (causal)
+        # Sink blocks: all Q blocks where q >= kv_start (causal) attend to them.
+        # Must iterate over all remaining Q blocks — can't avoid O(N) here.
         q_block_start = kv_start // BLOCK_M
-        q_block_end = NUM_Q_BLOCKS
+        dk, dv = _bwd_dkdv_inner(
+            dk, dv, k, v,
+            Q_bh, DO_bh, LSE_bh, D_bh,
+            offs_n, mask_n, offs_d,
+            stride_qn, stride_qd,
+            stride_don, stride_dod,
+            stride_lsen,
+            stride_dn,
+            q_block_start, NUM_Q_BLOCKS,
+            num_sink, window_size, scale, N, BLOCK_M,
+            NUM_Q_BLOCKS,
+        )
     else:
-        # Window blocks: Q blocks where kv_start is in their window
+        # Window blocks: only Q blocks within window_size attend to this KV.
         # A query q attends to key k if: k >= q - window_size + 1 AND k <= q
-        # For KV block [kv_start, kv_start+BLOCK_N-1], the max q that can attend
-        # to the last key is: kv_start + BLOCK_N - 1 + window_size - 1
+        # For KV block [kv_start, kv_start+BLOCK_N-1], the max q is:
+        #   kv_start + BLOCK_N - 1 + window_size - 1
         q_block_start = kv_start // BLOCK_M
         max_q = kv_start + BLOCK_N + window_size - 2
         q_block_end = tl.minimum(max_q // BLOCK_M + 1, NUM_Q_BLOCKS)
 
-    for block_m in range(NUM_Q_BLOCKS):
-        if block_m >= q_block_start and block_m < q_block_end:
-            q_start = block_m * BLOCK_M
-            offs_m = q_start + tl.arange(0, BLOCK_M)
-            mask_m = offs_m < N
-
-            q_ptrs = Q + pid_b * stride_qb + pid_h * stride_qh + \
-                     offs_m[:, None] * stride_qn + offs_d[None, :] * stride_qd
-            q = tl.load(q_ptrs, mask=mask_m[:, None], other=0.0)
-            q = (q * scale).to(q.dtype)
-
-            do_ptrs = DO + pid_b * stride_dob + pid_h * stride_doh + \
-                      offs_m[:, None] * stride_don + offs_d[None, :] * stride_dod
-            do = tl.load(do_ptrs, mask=mask_m[:, None], other=0.0)
-
-            lse_ptrs = LSE + pid_b * stride_lseb + pid_h * stride_lseh + offs_m * stride_lsen
-            lse = tl.load(lse_ptrs, mask=mask_m, other=0.0)
-
-            d_ptrs = D_arr + pid_b * stride_db + pid_h * stride_dh + offs_m * stride_dn
-            Di = tl.load(d_ptrs, mask=mask_m, other=0.0)
-
-            s = tl.dot(q, tl.trans(k))
-            valid_mask = _build_sink_window_mask(offs_m, offs_n, mask_m, mask_n,
-                                                  num_sink, window_size)
-
-            p = tl.exp(s - lse[:, None])
-            p = tl.where(valid_mask, p, 0.0)
-
-            dv += tl.dot(tl.trans(p.to(do.dtype)), do)
-
-            dp = tl.dot(do, tl.trans(v))
-            ds = p * (dp - Di[:, None])
-            ds = tl.where(valid_mask, ds, 0.0)
-
-            dk += tl.dot(tl.trans(ds.to(q.dtype)), q)
+        dk, dv = _bwd_dkdv_inner(
+            dk, dv, k, v,
+            Q_bh, DO_bh, LSE_bh, D_bh,
+            offs_n, mask_n, offs_d,
+            stride_qn, stride_qd,
+            stride_don, stride_dod,
+            stride_lsen,
+            stride_dn,
+            q_block_start, q_block_end,
+            num_sink, window_size, scale, N, BLOCK_M,
+            MAX_Q_BLOCKS_PER_WINDOW,
+        )
 
     dk_ptrs = DK + pid_b * stride_dkb + pid_h * stride_dkh + \
               offs_n[:, None] * stride_dkn + offs_d[None, :] * stride_dkd
@@ -537,6 +591,16 @@ class SinkFlashAttentionFunc(torch.autograd.Function):
         MAX_WINDOW_BLOCKS = triton.cdiv(window_size + BLOCK_M, BLOCK_N)
 
         # dK, dV
+        # Max Q blocks that any window KV block needs to iterate over:
+        # For KV at position kv_start, the Q range spans at most
+        # (window_size + BLOCK_N + BLOCK_M - 2) positions, or
+        # ceil((window_size + BLOCK_N + BLOCK_M) / BLOCK_M) blocks.
+        # This bounds the inner loop for window blocks, avoiding
+        # the O(N/BLOCK_M) iteration that sink blocks require.
+        MAX_Q_BLOCKS_PER_WINDOW = triton.cdiv(window_size + BLOCK_N + BLOCK_M, BLOCK_M)
+        # Ensure it doesn't exceed the total number of Q blocks
+        MAX_Q_BLOCKS_PER_WINDOW = min(MAX_Q_BLOCKS_PER_WINDOW, NUM_Q_BLOCKS)
+
         grid_dkdv = (NUM_KV_BLOCKS, B * H_q)
         _sink_flash_attn_bwd_dkdv_kernel[grid_dkdv](
             q, k, v, o, do, dk, dv,
@@ -556,6 +620,7 @@ class SinkFlashAttentionFunc(torch.autograd.Function):
             BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N,
             NUM_KV_HEADS=H_kv, NUM_Q_HEADS=H_q,
             NUM_Q_BLOCKS=NUM_Q_BLOCKS,
+            MAX_Q_BLOCKS_PER_WINDOW=MAX_Q_BLOCKS_PER_WINDOW,
         )
 
         # dQ
