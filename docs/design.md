@@ -231,6 +231,7 @@ sink_attention/
 ├── verl_patch.py                # Monkey-patch for verl / HuggingFace models
 ├── cache.py                     # KV cache (sink buffer + circular window)
 ├── generate_patch.py            # HuggingFace generate() integration
+├── subprocess_eval.py           # Subprocess-safe model.generate() (post-torchrun)
 └── sp_utils.py                  # Sequence parallelism utilities
 tests/
 ├── test_sink_attention.py       # Kernel correctness tests

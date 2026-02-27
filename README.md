@@ -410,6 +410,7 @@ sink_attention/
 ├── cache.py                  KV cache (sink buffer + circular window buffer)
 ├── decode_kernel.py          Decode-time attention (single-query)
 ├── generate_patch.py         HuggingFace generate() integration
+├── subprocess_eval.py        Subprocess-safe model.generate() (post-torchrun)
 ├── sp_utils.py               Sequence parallelism utilities
 └── verl_patch.py             verl/HuggingFace monkey patch (training, s_aux-aware)
 tests/
@@ -436,6 +437,36 @@ We use **separate prefill and decode kernels** by design. See [`docs/architectur
 - **Why FA3 can unify on B200** — TMA (async memory engine), warp specialization, and 1.67× higher HBM bandwidth let FA3 hide the serial KV walk.
 - **Backward efficiency vs FA3** — Our Triton backward is ~0.5–0.7× FA2's CUDA throughput on H200, with <1% overhead from `ds_aux`. FA3 on B200 is ~2–3× faster (mostly hardware gap, not algorithmic).
 - **Alignment with FA3 semantics** — Mathematically identical `s_aux` handling (softmax init: m=s_aux, l=1, o=0). Verified against gpt-oss eager reference.
+
+## Known Issues
+
+### CUDA context corruption after `torchrun`
+
+**Symptom**: `CUDA error: device-side assert triggered` (ScatterGatherKernel.cu, index out of bounds) when calling `model.generate()` after `torchrun` distributed training in the same process.
+
+**Cause**: This is a PyTorch/CUDA issue, not specific to this kernel. When `torchrun` spawns child processes that initialize NCCL and CUDA contexts, the parent process's CUDA runtime may be left in an inconsistent state. Any subsequent CUDA operation in the parent (including `model.generate()`) can trigger device-side asserts.
+
+**Who is affected**: Users who run `torchrun` training and then `model.generate()` (HuggingFace transformers) in the same script. This is more common for sink kernel users because vLLM (which naturally runs in a separate server process) does not support custom attention kernels, so users must use transformers for inference.
+
+**Note**: verl itself does not have this issue — it delegates generation to separate actor workers (for RL) or external vLLM servers, so it never runs `model.generate()` in the same process as `torchrun`.
+
+**Solution**: Run inference in a separate subprocess. We provide a utility for this:
+
+```python
+from sink_attention import subprocess_generate
+
+# After torchrun training completes in the same process:
+results = subprocess_generate(
+    model_path="/path/to/checkpoint",
+    input_texts=["Hello, world!", "What is 2+2?"],
+    max_new_tokens=256,
+    sink_attention=True,   # applies patch_verl_with_sink_attention() in subprocess
+    torch_dtype="bfloat16",
+)
+# results: list of generated strings
+```
+
+Or build your own subprocess wrapper — the key requirement is that `model.generate()` must run in a process that has never been a parent of `torchrun` child processes. See `sink_attention/subprocess_eval.py` for the full implementation.
 
 ## Limitations and Future Work
 

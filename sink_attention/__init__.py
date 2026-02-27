@@ -8,6 +8,7 @@ from .sp_utils import (
 from .cache import SinkCacheLayer, SinkAttentionCache
 from .decode_kernel import sink_decode_attention
 from .generate_patch import patch_for_generation, unpatch_generation
+from .subprocess_eval import subprocess_generate
 
 __version__ = "0.1.0"
 
@@ -23,4 +24,5 @@ __all__ = [
     "sink_decode_attention",
     "patch_for_generation",
     "unpatch_generation",
+    "subprocess_generate",
 ]
