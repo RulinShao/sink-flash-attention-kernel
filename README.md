@@ -440,17 +440,19 @@ We use **separate prefill and decode kernels** by design. See [`docs/architectur
 
 ## Known Issues
 
-### CUDA context corruption after `torchrun`
+### MoE scatter/gather errors with `device_map="auto"` on multi-GPU nodes
 
-**Symptom**: `CUDA error: device-side assert triggered` (ScatterGatherKernel.cu, index out of bounds) when calling `model.generate()` after `torchrun` distributed training in the same process.
+**Symptom**: `CUDA error: device-side assert triggered` (ScatterGatherKernel.cu, index out of bounds) when calling `model.generate()` with an MoE model (e.g., gpt-oss) on a multi-GPU node after `torchrun` distributed training.
 
-**Cause**: This is a PyTorch/CUDA issue, not specific to this kernel. When `torchrun` spawns child processes that initialize NCCL and CUDA contexts, the parent process's CUDA runtime may be left in an inconsistent state. Any subsequent CUDA operation in the parent (including `model.generate()`) can trigger device-side asserts.
+**Cause**: Two compounding issues:
+1. **MoE + multi-GPU**: When `device_map="auto"` spreads an MoE model across multiple GPUs, the expert routing scatter/gather operations can produce out-of-bounds indices because the routing table and expert weights end up on different devices.
+2. **Post-torchrun CUDA state**: After `torchrun` child processes have used all GPUs for NCCL communication, the GPU state may interfere with subsequent single-process inference.
 
-**Who is affected**: Users who run `torchrun` training and then `model.generate()` (HuggingFace transformers) in the same script. This is more common for sink kernel users because vLLM (which naturally runs in a separate server process) does not support custom attention kernels, so users must use transformers for inference.
+**Who is affected**: Users who run `torchrun` training on multi-GPU nodes and then run `model.generate()` (HuggingFace transformers) for evaluation. This is more common for sink kernel users because vLLM does not support custom attention kernels, so users must use the transformers engine for inference.
 
-**Note**: verl itself does not have this issue — it delegates generation to separate actor workers (for RL) or external vLLM servers, so it never runs `model.generate()` in the same process as `torchrun`.
+**Note**: verl itself does not have this issue — it delegates generation to separate actor workers (for RL) or external vLLM servers.
 
-**Solution**: Run inference in a separate subprocess. We provide a utility for this:
+**Solution**: Run inference in a **separate subprocess restricted to a single GPU**. We provide a utility:
 
 ```python
 from sink_attention import subprocess_generate
@@ -462,11 +464,12 @@ results = subprocess_generate(
     max_new_tokens=256,
     sink_attention=True,   # applies patch_verl_with_sink_attention() in subprocess
     torch_dtype="bfloat16",
+    env={"CUDA_VISIBLE_DEVICES": "0"},  # single GPU avoids MoE scatter issues
 )
 # results: list of generated strings
 ```
 
-Or build your own subprocess wrapper — the key requirement is that `model.generate()` must run in a process that has never been a parent of `torchrun` child processes. See `sink_attention/subprocess_eval.py` for the full implementation.
+Or build your own subprocess wrapper — the key requirements are: (1) use a fresh process (clean CUDA context), and (2) restrict to a single GPU for MoE models. See `sink_attention/subprocess_eval.py` for the full implementation.
 
 ## Limitations and Future Work
 
