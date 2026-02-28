@@ -63,6 +63,7 @@ def subprocess_generate(
     python_executable: Optional[str] = None,
     env: Optional[Dict[str, str]] = None,
     return_tokens: bool = False,
+    num_gpus: int = 0,
 ) -> Union[List[str], List[List[int]]]:
     """
     Run model.generate() in a fresh subprocess with a clean CUDA context.
@@ -103,6 +104,13 @@ def subprocess_generate(
         Extra environment variables for the subprocess.
     return_tokens : bool
         If True, return token IDs instead of decoded strings.
+    num_gpus : int
+        Number of GPUs to expose to the subprocess.
+
+        - ``0`` (default): **auto** — start with 1 GPU and retry with 2,
+          then 4 if the subprocess fails (e.g. OOM).
+        - ``1``: force single GPU (safest for MoE models).
+        - ``N``: force *N* GPUs via ``CUDA_VISIBLE_DEVICES=0,1,...,N-1``.
 
     Returns
     -------
@@ -146,24 +154,46 @@ def subprocess_generate(
         results_path=results_path,
     )
 
-    # Build environment
-    sub_env = os.environ.copy()
-    # Prevent CUDA OOM from fragmentation
-    sub_env.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+    # Build base environment
+    base_env = os.environ.copy()
+    base_env.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
     if env:
-        sub_env.update(env)
+        base_env.update(env)
 
-    print(f"[subprocess_generate] Launching model.generate() in fresh process ...")
-    proc = _sp.run(
-        [python, "-c", worker_script],
-        env=sub_env,
-        capture_output=False,  # let stdout/stderr pass through
-    )
+    # Determine the GPU schedule to try
+    if num_gpus > 0:
+        gpu_schedule = [num_gpus]
+    else:
+        # Auto mode: start with 1 GPU, escalate on failure (likely OOM)
+        gpu_schedule = [1, 2, 4]
 
-    if proc.returncode != 0:
-        print(
-            f"[subprocess_generate] ERROR: subprocess failed (rc={proc.returncode})"
+    rc = -1
+    for n_gpus in gpu_schedule:
+        sub_env = base_env.copy()
+        cuda_devs = ",".join(str(i) for i in range(n_gpus))
+        sub_env["CUDA_VISIBLE_DEVICES"] = cuda_devs
+
+        gpu_label = f"{n_gpus} GPU{'s' if n_gpus > 1 else ''}"
+        print(f"[subprocess_generate] Launching model.generate() ({gpu_label}) ...")
+
+        # Remove stale results from previous attempt
+        if os.path.exists(results_path):
+            os.unlink(results_path)
+
+        proc = _sp.run(
+            [python, "-c", worker_script],
+            env=sub_env,
+            capture_output=False,
         )
+        rc = proc.returncode
+        if rc == 0:
+            break
+        if n_gpus < gpu_schedule[-1]:
+            print(f"[subprocess_generate] Failed with {n_gpus} GPU(s) (rc={rc}), "
+                  f"retrying with more GPUs ...")
+
+    if rc != 0:
+        print(f"[subprocess_generate] ERROR: subprocess failed (rc={rc})")
         _cleanup(config_path, results_path)
         return []
 
@@ -289,4 +319,5 @@ with open("{results_path}", "w") as f:
 
 print(f"[subprocess_generate] Done. Generated {{len(results)}} outputs.")
 '''
+
 
